@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import math
@@ -38,6 +39,7 @@ from kiro_crew.dashboard.chat_auto_tag import maybe_auto_tag
 from kiro_crew.dashboard.chat_delivery import (
     STEER_REQUEUED,
     STEER_STEERED,
+    normalize_send_id,
     queue_for_next_turn,
     steer_into_running_turn,
 )
@@ -143,6 +145,113 @@ _SESSION_RELOAD_NOTICE = (
 _SLOT_SCOPED_TRUST_MODES = ("trust", "trust_reads")
 
 
+def _chat_idempotency_request_key(request: web.Request, user_meta: dict | None) -> str | None:
+    """Resolve the stable client key, preferring the existing body sendId."""
+    body_key = normalize_send_id(user_meta.get("sendId") if user_meta else None)
+    if body_key:
+        return body_key
+    return normalize_send_id(request.headers.get("X-Idempotency-Key"))
+
+
+def _chat_idempotency_scope(request: web.Request, slot: "_ChatSlot") -> str:
+    """Hash server-derived identity so claims cannot cross user/session/slot."""
+    principal = str(request.get("user") or "")
+    app = str(request.get("app") or "")
+    session_key = effective_session_key(slot)
+    raw = "\x00".join((principal, app, session_key, slot.key))
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
+
+
+def _chat_idempotency_fingerprint(
+    request: web.Request, slot: "_ChatSlot", message: str, agent: str
+) -> str:
+    """Hash only dispatch-relevant request fields; never persist message text."""
+    material = {
+        "message": message,
+        "agent": agent,
+        "slot": slot.key,
+        "session": effective_session_key(slot),
+        "steer": bool(request.get("steer")),
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+async def _claim_chat_idempotency(
+    state: DashboardState,
+    request: web.Request,
+    slot: "_ChatSlot",
+    message: str,
+    agent: str,
+    request_key: str | None,
+    receipt: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None, str, str]:
+    """Claim a keyed admission, returning status, replay receipt, and claim data."""
+    if not request_key:
+        return "disabled", None, "", ""
+    log = getattr(state, "conversation_log", None)
+    if log is None:
+        raise web.HTTPServiceUnavailable(text="chat idempotency store unavailable")
+    scope = _chat_idempotency_scope(request, slot)
+    fingerprint = _chat_idempotency_fingerprint(request, slot, message, agent)
+    try:
+        status, replay = await asyncio.to_thread(
+            log.claim_chat_idempotency,
+            effective_session_key(slot),
+            scope,
+            request_key,
+            fingerprint,
+            receipt,
+        )
+    except Exception:
+        # A keyed request cannot safely fall back to an in-memory claim: doing so
+        # would re-open the duplicate-turn race this ledger closes. Legacy sends
+        # without a key remain unchanged, while keyed sends fail closed until
+        # durable persistence is available.
+        logger.warning("chat idempotency claim failed; refusing keyed request", exc_info=True)
+        raise web.HTTPServiceUnavailable(text="chat idempotency store unavailable")
+    return status, replay, scope, fingerprint
+
+
+async def _complete_chat_idempotency(
+    state: DashboardState,
+    slot: "_ChatSlot",
+    request_key: str | None,
+    scope: str,
+    receipt: dict[str, Any],
+) -> None:
+    log = getattr(state, "conversation_log", None)
+    if not request_key or not scope or log is None:
+        return
+    try:
+        await asyncio.to_thread(
+            log.complete_chat_idempotency,
+            effective_session_key(slot),
+            scope,
+            request_key,
+            receipt,
+        )
+    except Exception:
+        logger.warning("chat idempotency receipt finalization failed", exc_info=True)
+
+
+async def _release_chat_idempotency(
+    state: DashboardState, slot: "_ChatSlot", request_key: str | None, scope: str
+) -> None:
+    log = getattr(state, "conversation_log", None)
+    if not request_key or not scope or log is None:
+        return
+    try:
+        await asyncio.to_thread(
+            log.release_chat_idempotency,
+            effective_session_key(slot),
+            scope,
+            request_key,
+        )
+    except Exception:
+        logger.warning("chat idempotency claim release failed", exc_info=True)
+
+
 def _sweep_stale_permissions(slot: "_ChatSlot") -> None:
     """Mark unresolved permissions from prior turns as stale.
 
@@ -195,6 +304,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     user_meta = body.get("meta")  # knowledge/files/pastes metadata from frontend
     if not isinstance(user_meta, dict):
         user_meta = None
+    idempotency_key = _chat_idempotency_request_key(request, user_meta)
     theme_consent = body.get("theme_consent") is True
     # Content-bound persona consent: the sha256 hex the user
     # granted in the consent modal. Injection is gated on this matching the
@@ -507,6 +617,29 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         )
 
     if slot.running or slot._in_stage_execution:
+        # A keyed retry must be claimed before steer/queue admission. The
+        # fallback receipt is the existing queue receipt; a successful steer
+        # replaces it below before the first response is returned.
+        _claim_scope = ""
+        if idempotency_key:
+            _claim_status, _replay, _claim_scope, _claim_fingerprint = (
+                await _claim_chat_idempotency(
+                    state,
+                    request,
+                    slot,
+                    message,
+                    agent,
+                    idempotency_key,
+                    {"ok": True, "queued": True},
+                )
+            )
+            if _claim_status == "conflict":
+                return web.json_response(
+                    {"error": "idempotency key reused", "code": "idempotency_key_reused"},
+                    status=409,
+                )
+            if _claim_status == "duplicate":
+                return web.json_response(_replay or {"ok": True, "queued": True})
         # Mid-turn steer: inject into the RUNNING turn instead of queueing for
         # the next turn. Gated on an explicit `steer` flag + a live, steer-capable
         # inner AcpClient that _run_chat published on the slot. App-authenticated
@@ -539,11 +672,19 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 send_id=user_meta.get("sendId") if user_meta else None,
             )
             if outcome == STEER_STEERED:
-                return web.json_response({"ok": True, "steered": True})
+                _receipt = {"ok": True, "steered": True}
+                await _complete_chat_idempotency(
+                    state, slot, idempotency_key, _claim_scope, _receipt
+                )
+                return web.json_response(_receipt)
             if outcome == STEER_REQUEUED:
                 # The turn's teardown moved it into the queue while the steer RPC
                 # was suspended — queueing again would deliver the same text twice.
-                return web.json_response({"ok": True, "queued": True})
+                _receipt = {"ok": True, "queued": True}
+                await _complete_chat_idempotency(
+                    state, slot, idempotency_key, _claim_scope, _receipt
+                )
+                return web.json_response(_receipt)
             # steer requested but unavailable -> fall through to queue below.
         # Queue the message - return JSON immediately (no SSE needed).
         # The existing SSE reader will pick up queued messages as _run_chat
@@ -555,8 +696,11 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             slot,
             message,
             directive_user_origin=not bool(request_app),
+            send_id=idempotency_key,
         )
-        return web.json_response({"ok": True, "queued": True})
+        _receipt = {"ok": True, "queued": True}
+        await _complete_chat_idempotency(state, slot, idempotency_key, _claim_scope, _receipt)
+        return web.json_response(_receipt)
 
     # ── Crew Mode dispatch (RFC orchestrator-chat-sessions) ─────────
     # MUST precede the hold-users gate below: crew topics ARE background
@@ -570,6 +714,26 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             return web.json_response(
                 {"error": "crew mode unavailable", "code": "crew_unavailable"}, status=503
             )
+        _claim_scope = ""
+        if idempotency_key:
+            _claim_status, _replay, _claim_scope, _claim_fingerprint = (
+                await _claim_chat_idempotency(
+                    state,
+                    request,
+                    slot,
+                    message,
+                    agent,
+                    idempotency_key,
+                    {"ok": True, "slot": slot.key, "crew": True},
+                )
+            )
+            if _claim_status == "conflict":
+                return web.json_response(
+                    {"error": "idempotency key reused", "code": "idempotency_key_reused"},
+                    status=409,
+                )
+            if _claim_status == "duplicate":
+                return web.json_response(_replay or {"ok": True, "slot": slot.key, "crew": True})
         # Do NOT append the user message here. `ingest` shows it only after the
         # queue entry is durable: a visible message with no queue entry (process
         # exit during a cold-store build) is a request that can never resume.
@@ -579,6 +743,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             user_meta=_redact_meta(user_meta) if user_meta else None,
         )
         if _refusal:
+            await _release_chat_idempotency(state, slot, idempotency_key, _claim_scope)
             # Crew declined this ingress (app-owned session). Answering 200 told
             # a programmatic caller its message was accepted for work that will
             # never run — the transcript note it posts is not visible to an API
@@ -587,7 +752,9 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 {"error": "crew mode is not available for this session", "code": _refusal},
                 status=409,
             )
-        return web.json_response({"ok": True, "slot": slot.key, "crew": True})
+        _receipt = {"ok": True, "slot": slot.key, "crew": True}
+        await _complete_chat_idempotency(state, slot, idempotency_key, _claim_scope, _receipt)
+        return web.json_response(_receipt)
 
     # Queue a message typed while background sub-agents are still running for
     # this slot. The slot.running queue path above covers the mid-turn case;
@@ -606,27 +773,83 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         # circular import: session_control imports this package's modules at module level.
         from kiro_crew.dashboard.session_control import containment_meta
 
+        _claim_scope = ""
+        if idempotency_key:
+            _claim_status, _replay, _claim_scope, _claim_fingerprint = (
+                await _claim_chat_idempotency(
+                    state,
+                    request,
+                    slot,
+                    message,
+                    agent,
+                    idempotency_key,
+                    {"ok": True, "queued": True},
+                )
+            )
+            if _claim_status == "conflict":
+                return web.json_response(
+                    {"error": "idempotency key reused", "code": "idempotency_key_reused"},
+                    status=409,
+                )
+            if _claim_status == "duplicate":
+                return web.json_response(_replay or {"ok": True, "queued": True})
+
+        _queue_meta = containment_meta(state, slot)
+        if idempotency_key:
+            _queue_meta["sendId"] = idempotency_key
         qid = slot.queue_append(
             message,
-            meta=containment_meta(state, slot),
+            meta=_queue_meta,
             directive_user_origin=not bool(request_app),
         )
         _c, _ = redact_exfiltration_urls(message)
         _c, _ = redact_credentials(_c)
         _redacted = _redact_for_display(_c)
-        state.broadcast_ws(
-            "queue_push",
-            {
-                "slot": slot.key,
-                "content": _redacted,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "queue_id": qid,
-            },
-        )
-        return web.json_response({"ok": True, "queued": True})
+        _queue_payload = {
+            "slot": slot.key,
+            "content": _redacted,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "queue_id": qid,
+        }
+        if idempotency_key:
+            _queue_payload["sendId"] = idempotency_key
+        state.broadcast_ws("queue_push", _queue_payload)
+        _receipt = {"ok": True, "queued": True}
+        await _complete_chat_idempotency(state, slot, idempotency_key, _claim_scope, _receipt)
+        return web.json_response(_receipt)
 
     # WS mode: return JSON immediately, chunks delivered via WebSocket
     ws_mode = request.query.get("ws") == "1"
+
+    # A normal turn can know its server receipt before admission: reserve the
+    # row id and pass it into slot.append so a replay returns the exact same
+    # receipt instead of minting a second transcript row.
+    _claim_scope = ""
+    _append_meta = _redact_meta(user_meta) if user_meta else None
+    _candidate_mid = _append_meta.get("mid") if isinstance(_append_meta, dict) else None
+    if idempotency_key and not isinstance(_candidate_mid, str):
+        _candidate_mid = f"m-{uuid.uuid4().hex[:16]}"
+        _append_meta = {**(_append_meta or {}), "mid": _candidate_mid}
+    _receipt = {"ok": True, "slot": slot.key}
+    if _candidate_mid:
+        _receipt["mid"] = _candidate_mid
+    if idempotency_key:
+        _claim_status, _replay, _claim_scope, _claim_fingerprint = await _claim_chat_idempotency(
+            state,
+            request,
+            slot,
+            message,
+            agent,
+            idempotency_key,
+            _receipt,
+        )
+        if _claim_status == "conflict":
+            return web.json_response(
+                {"error": "idempotency key reused", "code": "idempotency_key_reused"},
+                status=409,
+            )
+        if _claim_status == "duplicate":
+            return web.json_response(_replay or _receipt)
 
     slot._has_reader = not ws_mode  # Only block SSE broadcast if HTTP SSE reader
     slot._file_changes = []  # Reset file-change accumulator for the new turn
@@ -647,9 +870,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     # `chat_done` refresh rebuilds the transcript from disk. Without it, the
     # message-pin control (keyed on `meta.mid`) stays withheld for the whole
     # turn.
-    _user_row = slot.append(
-        "user", message, "msg msg-u", meta=_redact_meta(user_meta) if user_meta else None
-    )
+    _user_row = slot.append("user", message, "msg msg-u", meta=_append_meta)
     _user_mid = _user_row.get("meta", {}).get("mid")
 
     # Note: untitled slots display as "New Session…" via _ChatSlot.display_title
@@ -746,7 +967,9 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         task.add_done_callback(state._background_tasks.discard)
         state.push_slots_update()
         # All output delivered via WebSocket — return JSON like api_chat_plan_action
-        return web.json_response({"ok": True, "slot": slot.key})
+        _receipt = {"ok": True, "slot": slot.key}
+        await _complete_chat_idempotency(state, slot, idempotency_key, _claim_scope, _receipt)
+        return web.json_response(_receipt)
 
     # ── Orchestrator stop detection ─────────────────────────────────
     _stop_words = {"stop", "cancel", "abort"}
@@ -779,7 +1002,9 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             "chat_message", {"slot": slot.key, "role": "assistant", "content": stop_msg}
         )
         state.broadcast_ws("chat_done", {"slot": slot.key})
-        return web.json_response({"ok": True, "stopped": True})
+        _receipt = {"ok": True, "stopped": True}
+        await _complete_chat_idempotency(state, slot, idempotency_key, _claim_scope, _receipt)
+        return web.json_response(_receipt)
 
     # ── Reset rounds after user guidance (not a stop) ───────────────
     if tracker is not None and tracker.has_escalated:
@@ -849,11 +1074,13 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         # the message-pin control lights up immediately instead of only after
         # the chat_done refresh. Omitted when absent so the receipt shape is
         # unchanged for callers that never minted one.
-        _receipt: dict[str, Any] = {"ok": True, "slot": slot.key}
+        _receipt = {"ok": True, "slot": slot.key}
         if _user_mid:
             _receipt["mid"] = _user_mid
+        await _complete_chat_idempotency(state, slot, idempotency_key, _claim_scope, _receipt)
         return web.json_response(_receipt)
 
+    await _complete_chat_idempotency(state, slot, idempotency_key, _claim_scope, _receipt)
     resp = web.StreamResponse()
     resp.content_type = "text/event-stream"
     resp.headers["Cache-Control"] = "no-cache"

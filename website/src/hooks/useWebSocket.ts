@@ -10,17 +10,21 @@ import { dispatchMcNotification, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTur
 import { emitThemeSound } from './themeSound'
 import { streamingFlushHoldMs } from '../lib/streamHold'
 import {
-  fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop, sseSideQueue, reconcileWorkflowRuns
+  fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, hydrateLocalChatOutbox, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop, sseSideQueue, reconcileWorkflowRuns
 } from '../store/chatSlice'
 import { anchorForSlot, loadLayout, sessionSlots } from './splitLayoutStore'
 import { TAB_ID } from '../api/tabId'
 import { api } from '../api/client'
+import { listOutbox, recoverSendingOutbox, updateOutbox, localChatMessage, reconcileChatOutbox, type ChatOutboxRecord } from '../offline/outbox'
+import { readSendReceipt } from '../utils/sendDelivery'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
 import type { StatusData, ChatMessage, ChatSlot, ChatFolder, Notification, PullRequestStatusBatch, TodoList } from '../types'
 import { i18nT } from '../i18n/t'
 
 type LogCallback = ((data: { level: string; msg: string }) => void) | null
+
+let durableReplayPromise: Promise<void> | null = null
 
 /** How often a workflow row this tab still shows as `running` is re-checked
  *  against `/api/workflows/runs`. Deliberately slow: a run lasts minutes, this
@@ -718,6 +722,79 @@ export function useWebSocket() {
     scheduleSubagentChunkFlush()
   }, [dispatch, scheduleSubagentChunkFlush])
 
+  const replayDurableOutbox = useCallback(async () => {
+    if (durableReplayPromise) return durableReplayPromise
+    durableReplayPromise = (async () => {
+      await recoverSendingOutbox('unknown')
+      const records = (await listOutbox({ kind: 'chat' }))
+        .filter((record): record is ChatOutboxRecord => record.kind === 'chat')
+      const bySlot = new Map<string, ChatOutboxRecord[]>()
+      for (const record of records) {
+        if (!record.slotId) continue
+        const list = bySlot.get(record.slotId) ?? []
+        list.push(record)
+        bySlot.set(record.slotId, list)
+      }
+      const reconcileVisible = async (slot: string, slotRecords: ChatOutboxRecord[]) => {
+        const state = store.getState().chat
+        const messages = slot === state.activeSlot ? state.messages : (state.slotMessages[slot] ?? [])
+        const { matched, pending } = reconcileChatOutbox(slotRecords, messages)
+        for (const record of matched) {
+          const serverMessage = messages.find(message => message.meta?.sendId === record.sendId)
+          await updateOutbox(record.localId, {
+            status: 'delivered',
+            serverId: typeof serverMessage?.meta?.mid === 'string' ? serverMessage.meta.mid : record.serverId,
+          })
+        }
+        if (pending.length) dispatch(hydrateLocalChatOutbox({ slot, messages: pending.map(localChatMessage) }))
+      }
+      for (const [slot, slotRecords] of bySlot) await reconcileVisible(slot, slotRecords)
+      // One CAS claim and one request at a time prevents reconnect storms or a
+      // second tab from replaying the same send with a replacement identity.
+      for (const record of records) {
+        const current = (await listOutbox({ kind: 'chat', status: ['pending', 'unknown', 'error'] }))
+          .filter((item): item is ChatOutboxRecord => item.kind === 'chat')
+        if (!current.some(item => item.localId === record.localId)) continue
+        const latest = current.find(item => item.localId === record.localId)
+        if (!latest || !latest.slotId) continue
+        const sending = await updateOutbox(latest.localId, {
+          status: 'sending', attempts: latest.attempts + 1, lastAttemptAt: Date.now(), error: undefined,
+        }, { expectedUpdatedAt: latest.updatedAt })
+        if (!sending || sending.kind !== 'chat') continue
+        try {
+          const meta = sending.payload.meta && typeof sending.payload.meta === 'object'
+            ? sending.payload.meta as Record<string, unknown>
+            : { sendId: sending.sendId }
+          const response = await api.sendChat(
+            sending.payload.message,
+            typeof sending.payload.slot === 'string' ? sending.payload.slot : sending.slotId,
+            typeof sending.payload.color_theme === 'string' ? sending.payload.color_theme : undefined,
+            undefined,
+            { ...meta, sendId: sending.sendId },
+            false,
+            sending.sendId,
+          )
+          const { body, outcome } = await readSendReceipt(response)
+          if (outcome === 'accepted') {
+            await updateOutbox(sending.localId, body.queued
+              ? { status: 'queued' }
+              : { status: 'delivered', serverId: typeof body.mid === 'string' ? body.mid : undefined })
+          } else if (outcome === 'unknown') {
+            await updateOutbox(sending.localId, { status: 'unknown', error: { code: 'DELIVERY_UNKNOWN', message: i18nT('pages.chatPage.connection_error') as string } })
+          } else {
+            await updateOutbox(sending.localId, { status: 'error', error: { code: 'SEND_REFUSED', message: typeof body.error === 'string' ? body.error : i18nT('pages.chatPage.send_failed') as string } })
+          }
+        } catch (error) {
+          const unknown = error instanceof DOMException && error.name === 'AbortError'
+          await updateOutbox(sending.localId, unknown
+            ? { status: 'unknown', error: { code: 'DELIVERY_UNKNOWN', message: i18nT('pages.chatPage.connection_error') as string } }
+            : { status: 'error', error: { code: 'TRANSPORT_ERROR', message: i18nT('pages.chatPage.connection_error') as string } })
+        }
+      }
+    })().catch(() => undefined).finally(() => { durableReplayPromise = null })
+    return durableReplayPromise
+  }, [dispatch])
+
   const connect = useCallback(() => {
     // Guard against double-connect in StrictMode (dev) — if we already
     // have a WS that's open OR still connecting, reuse it.
@@ -800,7 +877,7 @@ export function useWebSocket() {
         syncWorkflowRuns()
         // Re-fetch active slot messages to recover from missed chunks
         const active = store.getState().chat.activeSlot
-        if (active) dispatch(refreshSlot(active))
+        const activeRefresh = active ? dispatch(refreshSlot(active)).unwrap().catch(() => null) : Promise.resolve(null)
         // refreshSlot self-guards to the ACTIVE slot, but the queue event family
         // (queue_push/cancel/edit/reorder) is broadcast fire-and-forget with no
         // replay — a mutation that happened while the socket was down never
@@ -826,6 +903,7 @@ export function useWebSocket() {
             console.warn('reconnect split-pane warm skipped', err)
           }
         }
+        void activeRefresh.then(() => replayDurableOutbox())
         // Eagerly subscribe to subagent events so chunks arrive even when
         // Activity Panel isn't open — final result still comes via done event.
         dispatch(clearSubagentsForSnapshot())
@@ -885,6 +963,7 @@ export function useWebSocket() {
       ws.send(
         JSON.stringify({ type: 'slot_focused', slot: store.getState().chat.activeSlot || null })
       )
+      void replayDurableOutbox()
     }
 
     ws.onmessage = (e) => {
@@ -1229,6 +1308,14 @@ export function useWebSocket() {
           case 'chat_message':
             flushChunks()
             dispatch(sseChatMessage(data))
+            const liveSendId = data.role === 'user' && typeof data.meta?.sendId === 'string' ? data.meta.sendId : ''
+            if (liveSendId) {
+              void listOutbox({ kind: 'chat' }).then(records => {
+                const record = records.find(item => item.kind === 'chat' && item.sendId === liveSendId)
+                if (record?.kind === 'chat') return updateOutbox(record.localId, { status: 'delivered', serverId: typeof data.meta?.mid === 'string' ? data.meta.mid : record.serverId })
+                return undefined
+              })
+            }
             // Re-rank the sidebar the instant a session sees a message, instead of waiting
             // for the next full slots push. `last_ts` moves for agent output too (it feeds
             // "last message" reads); the ORDERING key moves only for an inbound prompt —
@@ -1271,6 +1358,14 @@ export function useWebSocket() {
             break
           case 'queue_push':
             dispatch(appendQueuedMessage(data))
+            const queuedSendId = typeof data.sendId === 'string' ? data.sendId : ''
+            if (queuedSendId) {
+              void listOutbox({ kind: 'chat' }).then(records => {
+                const record = records.find(item => item.kind === 'chat' && item.sendId === queuedSendId)
+                if (record?.kind === 'chat') return updateOutbox(record.localId, { status: 'queued' })
+                return undefined
+              })
+            }
             // A send that lands behind a busy turn is still user input, so it
             // settles the session's rank now rather than only when the queue pops
             // — otherwise typing into a working session leaves it where it was.
@@ -1868,7 +1963,7 @@ export function useWebSocket() {
     }
 
     ws.onerror = () => { /* onclose will fire */ }
-  }, [dispatch, flushChunks, flushBufferedThinking, scheduleChunkFlush, bufferSlotActivity, bufferSubagentChunk, flushSubagentChunks, playNextVoiceChunk, queryClient, stopVoice, syncPendingApprovals, syncPendingQuestions, seedGoalLoops, recordRetiredId])
+  }, [dispatch, flushChunks, flushBufferedThinking, scheduleChunkFlush, bufferSlotActivity, bufferSubagentChunk, flushSubagentChunks, playNextVoiceChunk, queryClient, stopVoice, syncPendingApprovals, syncPendingQuestions, seedGoalLoops, recordRetiredId, replayDurableOutbox])
 
   /**
    * Force an immediate reconnect: cancels any pending backoff timer, closes

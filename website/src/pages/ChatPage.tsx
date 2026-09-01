@@ -38,6 +38,7 @@ import {
   mcpAppKey,
 } from '../store/chatSlice'
 import { confirmedDelivered, readSendReceipt } from '../utils/sendDelivery'
+import { enqueueChat, updateOutbox, type ChatOutboxRecord } from '../offline/outbox'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
 import { onTerminalReady, sendToTerminalSession } from '../utils/terminalRegistry'
 import { addTab as addDockTerminal } from '../hooks/useBottomTerminal'
@@ -4210,14 +4211,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   planActionMutationRef.current = planActionMutation
 
   const send = useCallback(async (optionText?: string, targetSlot?: string, steerNow?: boolean) => {
-    // Defense-in-depth: ChatInput already gates Send/Optimize buttons and
-    // the keyboard Enter shortcut on `connected`, but a future caller (a
-    // programmatic dispatch from a hotkey, a follow-up option click, an
-    // intent handler) could call send() while offline. Bail before we
-    // clear the draft via setInput('') below — losing the user's typed
-    // message with no recovery path is the offline-UX regression we're
-    // guarding against. Cheap belt-and-braces.
-    if (!connected) return
+    // Existing-slot sends are durably recorded below before the composer is
+    // cleared. New-session and unsupported card flows remain drafts offline.
     const raw = (optionText || inputRef.current).trim()
  // Capture + clear the widget-origin tag: attribute this
     // turn to a widget only if the composer still carries the exact text a
@@ -4362,25 +4357,25 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const bubblePastes = pruneBlocksUtil(displayTxt, activePastes)
     if (bubblePastes.length) saveStoredPaste(llmTxt, displayTxt, bubblePastes, filePaths)
 
-    setPrefillHint(false)
-    if (!optionText) {
-      setInput(''); setPendingFiles([]); pickedFileTokens.current = {}; setPasteBlocks([]); setPendingSessions([]); if (uiSlot) { delete drafts.current[uiSlot]; delete fileDrafts.current[uiSlot]; delete pasteDrafts.current[uiSlot]; delete sessionRefDrafts.current[uiSlot]; saveDrafts() }
-      // The challenge-handoff prompt is seeded into PREFILL_STORAGE_KEY and the
-      // slot-restore effect re-applies it on slot changes. Once that prompt is
-      // sent, clear the seed so a later slot-restore can't re-fill the (now
-      // empty) composer with the already-sent text.
-      try { sessionStorage.removeItem(PREFILL_STORAGE_KEY) } catch { /* sessionStorage unavailable */ }
-    }
     // Target the slot the user is actually looking at (uiSlot, from the ref),
     // not the stale closure `activeSlot`. See the uiSlot note above.
     let slot = targetSlot ?? uiSlot
     // Only a normal (non-targeted) send consumes the one-shot "new session"
-    // intent. A targeted send — e.g. submitting document comments to the
-    // document's origin slot — must leave it intact for the user's next send.
+    // intent. A targeted send leaves it intact for the user's next send.
     let forceNew = false
     if (!targetSlot) {
       forceNew = newSessionRef.current
       newSessionRef.current = false
+    }
+    // Existing-slot ordinary messages are enqueued below before clearing. New
+    // sessions cannot be replayed safely because their slot does not exist yet,
+    // and card answers have separate server lifecycles.
+    const durableChat = !!slot && !forceNew && !steerNow && !cardAtSend && !askAtSend
+
+    setPrefillHint(false)
+    if (!optionText && !durableChat) {
+      setInput(''); setPendingFiles([]); pickedFileTokens.current = {}; setPasteBlocks([]); setPendingSessions([]); if (uiSlot) { delete drafts.current[uiSlot]; delete fileDrafts.current[uiSlot]; delete pasteDrafts.current[uiSlot]; delete sessionRefDrafts.current[uiSlot]; saveDrafts() }
+      try { sessionStorage.removeItem(PREFILL_STORAGE_KEY) } catch { /* sessionStorage unavailable */ }
     }
     if (!slot || forceNew) {
       sendingRef.current = true;
@@ -4558,19 +4553,64 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const sendId = mintSendId()
     meta.sendId = sendId
     const metaPayload = meta
-    // Skip optimistic user bubble when the slot is busy (shared rule:
+    let durableRecord: ChatOutboxRecord | undefined
+    if (durableChat && slot) {
+      try {
+        durableRecord = await enqueueChat({
+          localId: sendId,
+          clientId: sendId,
+          sendId,
+          slotId: slot,
+          payload: {
+            message: llmTxt,
+            slot,
+            ...(colorThemeRef.current ? { color_theme: colorThemeRef.current } : {}),
+            ...(metaPayload ? { meta: metaPayload } : {}),
+            ...(steerNow ? { steer: true } : {}),
+          },
+          displayPayload: {
+            content: displayTxt,
+            role: 'user',
+            ts: Date.now(),
+            sendId,
+            metadata: metaPayload,
+          },
+        })
+      } catch {
+        // IndexedDB can be unavailable in embedded/test contexts. Preserve the
+        // established online send path; offline still refuses to clear.
+        if (!connected) {
+          sendingRef.current = false
+          dispatch(appendSlotMessage({ slot, message: { role: 'error', content: i18nT('pages.chatPage.connection_error'), cls: '' } }))
+          return
+        }
+      }
+    }
+    if (!optionText && durableChat) {
+      setInput(current => current.trim() === raw ? '' : current)
+      setPendingFiles(current => current.length === sentFiles.length && current.every((file, i) => file === sentFiles[i]) ? [] : current)
+      pickedFileTokens.current = {}; setPasteBlocks([]); setPendingSessions([])
+      if (uiSlot) { delete drafts.current[uiSlot]; delete fileDrafts.current[uiSlot]; delete pasteDrafts.current[uiSlot]; delete sessionRefDrafts.current[uiSlot]; saveDrafts() }
+      try { sessionStorage.removeItem(PREFILL_STORAGE_KEY) } catch { /* sessionStorage unavailable */ }
+    }
     // chatSlice.selectComposerBusy) — the backend sends a "queued" role
     // message instead, avoiding a duplicate. A steer-flagged send usually
     // bypasses the queue and starts a turn, so nothing would represent it; its
     // bubble is appended from the response instead (see below), because only
     // the server knows whether this particular send got queued after all.
     const _busy = selectComposerBusy(store.getState(), slot ?? null)
-    if (!_busy || forceNew) {
-      dispatch(appendMessage({ role: 'user', content: displayTxt, cls: '', ts: new Date().toISOString(), meta: metaPayload }))
+    const optimisticMeta = (!connected && durableRecord)
+      ? { ...metaPayload, localOutbox: true, localOutboxId: durableRecord.localId, outboxStatus: durableRecord.status }
+      : metaPayload
+    if ((!_busy || !connected || forceNew) && (displayTxt || sentFiles.length)) {
+      dispatch(appendMessage({ role: 'user', content: displayTxt, cls: '', ts: new Date().toISOString(), meta: optimisticMeta }))
     }
     window.dispatchEvent(new Event('voice-stop'))
     sendingRef.current = false
     setTimeout(() => scrollBottom(), SCROLL_AFTER_RENDER_MS)
+    // With no socket, the durable row is the source of truth. Do not call the
+    // gateway until reconnect replay; this preserves the same sendId.
+    if (!connected && durableRecord) return
     if (slot) dispatch(startLocalTurn(slot))
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 10_000)
@@ -4637,9 +4677,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       }
     }
     try {
-      const r = await api.sendChat(llmTxt, slot ?? undefined, colorThemeRef.current, controller.signal, metaPayload, steerNow)
+      const r = await api.sendChat(llmTxt, slot ?? undefined, colorThemeRef.current, controller.signal, metaPayload, steerNow, durableRecord?.sendId ?? sendId)
       clearTimeout(timeout)
       const { body, outcome } = await readSendReceipt(r)
+      if (durableRecord && outcome === 'unknown') await updateOutbox(durableRecord.localId, { status: 'unknown', error: { code: 'DELIVERY_UNKNOWN', message: i18nT('pages.chatPage.connection_error') as string } })
       // An UNKNOWN outcome — a 2xx whose body would not parse — reaches neither
       // arm below and is the point of routing through `readSendReceipt`. The
       // request was accepted and only its answer is mangled, so this send sits
@@ -4648,13 +4689,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // back and invite a retry that duplicates a delivered turn, so an unknown
       // takes no action rather than asserting a refusal it cannot prove.
       if (outcome === 'refused') {
+        if (durableRecord) await updateOutbox(durableRecord.localId, { status: 'error', error: { code: 'SEND_REFUSED', message: typeof body.error === 'string' ? body.error : i18nT('pages.chatPage.send_failed') as string } })
         dispatch(setSlotRunning(false))
         const reason = typeof body.error === 'string' ? body.error : ''
         dispatch(appendMessage({ role: 'error', content: reason || i18nT('pages.chatPage.send_failed'), cls: '' }))
         // The server explicitly accepted neither (`ok` nor `queued`), so nothing
         // was sent — recovering the composer cannot duplicate a delivered turn.
         restoreComposerAfterFailedSend()
-      } else if (outcome === 'accepted' && steerNow && _busy && !body.queued && !body.steered) {
+      } else if (outcome === 'accepted' && durableRecord) {
+        await updateOutbox(durableRecord.localId, body.queued
+          ? { status: 'queued' }
+          : { status: 'delivered', serverId: typeof body.mid === 'string' ? body.mid : undefined })
+      }
+      if (outcome === 'accepted' && steerNow && _busy && !body.queued && !body.steered) {
         // A steer-flagged send the server neither queued nor injected: it
         // started a turn, so no `queue_push` or `steer_push` echo is coming and
         // the busy rule above left the text with nothing to represent it.
@@ -4728,8 +4775,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     } catch (e: unknown) {
       clearTimeout(timeout)
       if (e instanceof DOMException && e.name === 'AbortError') {
+        if (durableRecord) await updateOutbox(durableRecord.localId, { status: 'unknown', error: { code: 'DELIVERY_UNKNOWN', message: i18nT('pages.chatPage.connection_error') as string } })
         // Timeout — message was received, WS will deliver response
       } else {
+        if (durableRecord) await updateOutbox(durableRecord.localId, { status: 'error', error: { code: 'TRANSPORT_ERROR', message: i18nT('pages.chatPage.connection_error') as string } })
         dispatch(setSlotRunning(false))
         dispatch(appendMessage({ role: 'error', content: i18nT('pages.chatPage.connection_error'), cls: '' }))
         restoreComposerAfterFailedSend()

@@ -136,6 +136,9 @@ function reconcileOptimisticEcho(
       // persisted meta now that reconciliation succeeded (#3898 item 2).
       delete (m.meta as Record<string, unknown>).sendId
       delete (m.meta as Record<string, unknown>).optimistic
+      delete (m.meta as Record<string, unknown>).localOutbox
+      delete (m.meta as Record<string, unknown>).localOutboxId
+      delete (m.meta as Record<string, unknown>).outboxStatus
       return true
     }
     // #3898 fix: continue scanning past non-matching user messages so
@@ -432,7 +435,7 @@ export const shouldResolveAskOnSend = (
 
 /** One queued-message entry as normalized by `fetchSlotDetail` from the backend
  *  slot-detail `queue` field. */
-type SlotQueueItem = { content: string; queueId: string; ts: string }
+type SlotQueueItem = { content: string; queueId: string; ts: string; sendId?: string }
 
 /** Field-for-field equality over every `ChatMessage` field a consumer can render. */
 function sameMessage(a: ChatMessage, b: ChatMessage): boolean {
@@ -470,8 +473,12 @@ function hydrateQueuedBubbles(
   queue: SlotQueueItem[] | undefined,
 ): ChatMessage[] {
   const base = list.filter((m) => m.role !== 'queued')
-  for (const { content, queueId, ts } of queue ?? []) {
-    base.push({ role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId } })
+  for (const { content, queueId, ts, sendId } of queue ?? []) {
+    if (sendId) {
+      const localIndex = base.findIndex(message => message.meta?.sendId === sendId && message.meta?.localOutbox)
+      if (localIndex >= 0) base.splice(localIndex, 1)
+    }
+    base.push({ role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId, ...(sendId ? { sendId } : {}) } })
   }
   return base
 }
@@ -3132,6 +3139,20 @@ const chatSlice = createSlice({
       }
       state.messages.push(ensureMsgId(m))
     },
+    /** Restore durable local chat rows after reload/reconnect. These are normal
+     *  user rows; server `queued` rows remain gateway-owned queue controls. */
+    hydrateLocalChatOutbox(state, action: PayloadAction<{ slot: string; messages: ChatMessage[] }>) {
+      const { slot, messages } = action.payload
+      if (isUnsafeKey(slot)) return
+      const target = slot === state.activeSlot ? state.messages : (state.slotMessages[safeKey(slot)] ??= [])
+      const existing = new Set(target.map(message => message.meta?.sendId).filter((id): id is string => typeof id === 'string'))
+      for (const message of messages) {
+        const sendId = message.meta?.sendId
+        if (typeof sendId !== 'string' || existing.has(sendId)) continue
+        target.push(ensureMsgId(message))
+        existing.add(sendId)
+      }
+    },
     /** Optimistically append a message to a specific slot's store — global
      *  `messages` when it's the active slot, else `slotMessages[slot]`. Lets a
      *  grid pane show a just-sent user message immediately in the right place. */
@@ -4625,14 +4646,18 @@ const chatSlice = createSlice({
     },
     /** Add a queued message (from backend queue_push WS event). */
     appendQueuedMessage: {
-      reducer(state, action: PayloadAction<{ slot: string; content: string; ts: string; queueId: string }>) {
-        const { slot, content, ts, queueId } = action.payload
+      reducer(state, action: PayloadAction<{ slot: string; content: string; ts: string; queueId: string; sendId?: string }>) {
+        const { slot, content, ts, queueId, sendId } = action.payload
         const msgs = slot === state.activeSlot ? state.messages : (state.slotMessages[safeKey(slot)] ??= [])
+        if (sendId) {
+          const localIndex = msgs.findIndex(m => m.meta?.sendId === sendId && m.meta?.localOutbox)
+          if (localIndex >= 0) msgs.splice(localIndex, 1)
+        }
         // A row with this queueId may ALREADY exist: slot-detail hydration
         // can land before a delayed `queue_push` for the same entry. Appending
         // blindly would duplicate the row; keep the existing one.
         if (msgs.some(m => m.role === 'queued' && (m.meta?.queueId as string) === queueId)) return
-        msgs.push({ role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId } })
+        msgs.push({ role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId, ...(sendId ? { sendId } : {}) } })
       },
       prepare(payload: { slot: string; content: string; ts: string; queue_id?: string }) {
         return { payload: { ...payload, queueId: payload.queue_id || crypto.randomUUID() } }
@@ -5336,7 +5361,7 @@ const chatSlice = createSlice({
 })
 
 export const {
-  setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
+  setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, hydrateLocalChatOutbox, updateStreamingMessage, finalizeAssistant,
   removeThinking, confirmOptimisticSend, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
   sseContextUsage, setVoicePlaying, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,

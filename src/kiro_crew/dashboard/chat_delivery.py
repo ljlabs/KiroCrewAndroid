@@ -376,6 +376,7 @@ def queue_for_next_turn(
     message: str,
     *,
     directive_user_origin: bool = False,
+    send_id: str | None = None,
 ) -> str:
     """Append *message* to the slot's queue and announce it; return the queue id.
 
@@ -387,16 +388,19 @@ def queue_for_next_turn(
 
     qid = slot.queue_append(
         message,
-        meta=containment_meta(state, slot),
+        meta={
+            **containment_meta(state, slot),
+            **({"sendId": send_id} if send_id else {}),
+        },
         directive_user_origin=directive_user_origin,
     )
-    state.broadcast_ws(
-        "queue_push",
-        {
-            "slot": slot.key,
-            "content": _redact_for_display(sanitize_outbound(message)),
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "queue_id": qid,
-        },
-    )
+    payload = {
+        "slot": slot.key,
+        "content": _redact_for_display(sanitize_outbound(message)),
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "queue_id": qid,
+    }
+    if send_id:
+        payload["sendId"] = send_id
+    state.broadcast_ws("queue_push", payload)
     return qid

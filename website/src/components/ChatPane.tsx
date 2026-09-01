@@ -20,6 +20,7 @@ import { useProvider } from '../providers'
 import { useAgents } from '../hooks/useAgents'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
+import { useConnected } from '../hooks/useConnected'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions } from '../hooks/useQueuedMessageActions'
@@ -30,6 +31,7 @@ import { deriveFollowUpOptions } from '../app-sdk/protocol'
 import { CONTENT_WIDTH, loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
 import { tryQuickSend } from '../lib/quickSend'
 import { confirmedDelivered, readSendReceipt } from '../utils/sendDelivery'
+import { enqueueChat, updateOutbox, type ChatOutboxRecord } from '../offline/outbox'
 import { mergeRecoveredDraft } from '../utils/chatDrafts'
 import { triggerRefresh, updateSlot } from '../store/dashboardSlice'
 import { performSlotSwitch } from '../lib/slotSwitch'
@@ -100,6 +102,7 @@ export default function ChatPane({
   // One instance covers both dropdown filter inputs (never open at once).
   const dispatch = useAppDispatch()
   const provider = useProvider()
+  const connected = useConnected()
   // Same gate the main chat uses: hide a Connections-owned OAuth banner only
   // while the card that owns that flow is reachable.
   const connectionsUiOn = useConnectionsUiEnabled()
@@ -454,7 +457,7 @@ export default function ChatPane({
     }))
   }, [dispatch, slotKey])
 
-  const doSend = useCallback((optionText?: string) => {
+  const doSend = useCallback(async (optionText?: string) => {
     // `optionText` mirrors ChatPage.send's first parameter: the follow-up
     // bar's direct-send gesture (double-click / split button) hands the option
     // label here so it bypasses the setInput race, superseding any composer
@@ -479,10 +482,6 @@ export default function ChatPane({
     // loss). Consuming the draft or attachments here would wipe text the user
     // never sent and attach files to a message they never composed.
     const files = optionText ? [] : pendingFiles
-    if (!optionText) {
-      setInput('')
-      setPendingFiles([])
-    }
     // Folder tokens take the same wire/bubble split ChatPage uses: the wire
     // text carries `[attached_dir N] path` markers the agent can resolve, the
     // bubble keeps the `@path/` token for the chip, and `meta.dirs` indexes
@@ -503,12 +502,42 @@ export default function ChatPane({
       ...(dirPaths.length ? { dirs: dirPaths } : {}),
       sendId,
     }
-    if (!busy && (text || files.length)) {
+    const durableChat = !cardAtSend && !askAtSend
+    let durableRecord: ChatOutboxRecord | undefined
+    if (durableChat) {
+      try {
+        durableRecord = await enqueueChat({
+          localId: sendId,
+          clientId: sendId,
+          sendId,
+          slotId: slotKey,
+          payload: { message: llm, slot: slotKey, meta },
+          displayPayload: { content: text, role: 'user', ts: Date.now(), sendId, metadata: meta },
+        })
+      } catch {
+        // Keep online sends compatible with embedded contexts without IndexedDB;
+        // an offline send must retain its composer instead of falling through.
+        if (!connected) {
+          dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'error', content: i18nT('pages.chatPage.connection_error'), cls: '' } }))
+          if (!optionText) restoreIntoComposer(text, files)
+          return
+        }
+      }
+    }
+    if (!optionText) {
+      setInput(current => current.trim() === text ? '' : current)
+      setPendingFiles(current => current === files ? [] : current)
+    }
+    if (!busy && (text || files.length) || (!connected && durableRecord && (text || files.length))) {
+      const optimisticMeta = (!connected && durableRecord)
+        ? { ...meta, localOutbox: true, localOutboxId: durableRecord.localId, outboxStatus: durableRecord.status }
+        : meta
       dispatch(appendSlotMessage({
         slot: slotKey,
-        message: { role: 'user', content: text, cls: 'msg msg-u', ts: new Date().toISOString(), ...(meta ? { meta } : {}) },
+        message: { role: 'user', content: text, cls: 'msg msg-u', ts: new Date().toISOString(), ...(optimisticMeta ? { meta: optimisticMeta } : {}) },
       }))
     }
+    if (!connected && durableRecord) return
     // A failed send has to say so on the pane it was typed into. This path
     // reported nothing at all: the composer had already cleared and a rejected
     // fetch was swallowed by `.catch(() => undefined)`, so an undelivered
@@ -529,14 +558,16 @@ export default function ChatPane({
     // the removed 30s notice used to speak sooner.
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), SEND_ABORT_MS)
-    api.sendChat(llm, slotKey, undefined, controller.signal, meta)
+    api.sendChat(llm, slotKey, undefined, controller.signal, meta, undefined, durableRecord?.sendId ?? sendId)
       .then(async (r) => {
         clearTimeout(timeout)
         const { body, outcome } = await readSendReceipt(r)
+        if (durableRecord && outcome === 'unknown') await updateOutbox(durableRecord.localId, { status: 'unknown', error: { code: 'DELIVERY_UNKNOWN', message: i18nT('pages.chatPage.connection_error') as string } })
         // The server accepted neither `ok` nor `queued` (or refused with a status
         // and no readable body), so nothing was sent. Reported before the card
         // logic below, which only runs on acceptance.
         if (outcome === 'refused') {
+          if (durableRecord) await updateOutbox(durableRecord.localId, { status: 'error', error: { code: 'SEND_REFUSED', message: typeof body.error === 'string' ? body.error : i18nT('pages.chatPage.send_failed') as string } })
           reportFailedSend(typeof body.error === 'string' ? body.error : undefined)
           return
         }
@@ -557,6 +588,9 @@ export default function ChatPane({
         // comes back rather than vanishing. (The same request answers 400 when
         // the slot is idle, which the branch above already handles.)
         if (body.queued && !llm.trim()) { reportFailedSend(); return }
+        if (durableRecord) await updateOutbox(durableRecord.localId, body.queued
+          ? { status: 'queued' }
+          : { status: 'delivered', serverId: typeof body.mid === 'string' ? body.mid : undefined })
         // The response is the delivery receipt for this pane's optimistic bubble
         // (#4131) — see the same dispatch in ChatPage.send for why no `chat_message`
         // echo is coming. Parsed unconditionally now: the previous early return on
@@ -570,7 +604,7 @@ export default function ChatPane({
         if (body.ok && !body.queued && cardAtSend) dispatch(retireStatelessQuestion({ slot: slotKey, expected: cardAtSend }))
         void resolveAskAfterSend(body, askAtSend, dispatch)
       })
-      .catch((e: unknown) => {
+      .catch(async (e: unknown) => {
         clearTimeout(timeout)
         // An abort means the request WAS received and only the RESPONSE is late,
         // which is what `ChatPage` records at its own timeout ("message was
@@ -579,10 +613,14 @@ export default function ChatPane({
         // the payload back and invite a retry that duplicates a turn already in
         // flight, side effects included. Only a rejection that is NOT an abort
         // means the send never left.
-        if (e instanceof DOMException && e.name === 'AbortError') return
+        if (e instanceof DOMException && e.name === 'AbortError') {
+          if (durableRecord) await updateOutbox(durableRecord.localId, { status: 'unknown', error: { code: 'DELIVERY_UNKNOWN', message: i18nT('pages.chatPage.connection_error') as string } })
+          return
+        }
+        if (durableRecord) await updateOutbox(durableRecord.localId, { status: 'error', error: { code: 'TRANSPORT_ERROR', message: i18nT('pages.chatPage.connection_error') as string } })
         reportFailedSend()
       })
-  }, [input, pendingFiles, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure])
+  }, [input, pendingFiles, busy, connected, slotKey, dispatch, restoreIntoComposer, reportSendFailure])
 
   const onStop = useCallback(() => { dispatch(requestStop({ slotId: slotKey, force: false })) }, [dispatch, slotKey])
   // The same queue-card recipe the single-chat surface runs (#5891), owned once

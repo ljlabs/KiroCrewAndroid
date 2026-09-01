@@ -4221,14 +4221,15 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     for item in consumed:
         content, _ = redact_exfiltration_urls(item["content"])
         content, _ = redact_credentials(content)
-        state.broadcast_ws(
-            "queue_pop",
-            {
-                "slot": slot.key,
-                "content": _redact_for_display(content),
-                "queue_id": item["id"],
-            },
-        )
+        _queue_pop_payload = {
+            "slot": slot.key,
+            "content": _redact_for_display(content),
+            "queue_id": item["id"],
+        }
+        _queue_send_id = item.get("meta", {}).get("sendId") if isinstance(item.get("meta"), dict) else None
+        if isinstance(_queue_send_id, str) and _queue_send_id:
+            _queue_pop_payload["sendId"] = _queue_send_id
+        state.broadcast_ws("queue_pop", _queue_pop_payload)
         _remove_queued_by_id(slot.messages, item["id"])
 
     next_msg, _ = redact_exfiltration_urls(next_msg)

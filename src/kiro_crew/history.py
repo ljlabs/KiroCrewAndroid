@@ -1048,6 +1048,11 @@ def latest_transcript_ts(*candidates: str | None) -> str | None:
 _METADATA_READ_ATTEMPTS = 3
 _METADATA_READ_RETRY_SECS = 0.02
 
+# POST /api/chat idempotency claims are durable sidecar records rather than
+# transcript rows. Keep enough history to cover normal offline replay windows,
+# while preventing an unbounded send-id ledger from becoming a second transcript.
+_CHAT_IDEMPOTENCY_MAX_ENTRIES = 512
+
 
 class ConversationLog:
     """Append-only JSONL conversation store with provenance and rotation."""
@@ -1897,6 +1902,121 @@ class ConversationLog:
             # the persisted rows untouched — an id is never retrofitted onto a
             # row already on disk.
             self.append(key, role, content, agent=agent, tab_id=tab_id, cls=cls, mid=mid)
+            return True
+
+    def _chat_idempotency_path(self, key: str) -> Path:
+        """Return the durable send-claim sidecar for one conversation key.
+
+        The sidecar is deliberately separate from the transcript: queued and
+        crew admissions may not have a user row yet, and idempotency metadata is
+        request bookkeeping rather than conversation content. Mutations use
+        ``_locked(key)`` below, so this sidecar shares the transcript's
+        process-safe lock without adding another locking implementation.
+        """
+        return self._dir / ".chat-idempotency" / f"{_safe_key(key)}.json"
+
+    def claim_chat_idempotency(
+        self,
+        key: str,
+        scope: str,
+        request_key: str,
+        fingerprint: str,
+        receipt: dict[str, Any],
+        *,
+        max_entries: int = _CHAT_IDEMPOTENCY_MAX_ENTRIES,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Atomically claim or replay a keyed ``POST /api/chat`` admission.
+
+        Returns ``("claimed", None)`` for the first request, ``("duplicate",
+        receipt)`` for a replay with the same request fingerprint, and
+        ``("conflict", receipt)`` when a client reuses a key for different
+        content. ``scope`` is supplied by the authenticated request layer and
+        must include the server-derived user, session, and slot identity.
+
+        This runs off the event loop in the handler. The read/check/write is one
+        ``_locked`` critical section, and the bounded tail is rewritten
+        atomically, so concurrent gateway processes cannot both admit a turn.
+        """
+        if not request_key or not scope or not fingerprint:
+            return "claimed", None
+        path = self._chat_idempotency_path(key)
+        with self._locked(key):
+            entries: list[dict[str, Any]] = []
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    entries = [entry for entry in loaded if isinstance(entry, dict)]
+            except (OSError, json.JSONDecodeError):
+                pass
+
+            for entry in reversed(entries):
+                if entry.get("scope") != scope or entry.get("key") != request_key:
+                    continue
+                stored_receipt = entry.get("receipt")
+                if not isinstance(stored_receipt, dict):
+                    stored_receipt = dict(receipt)
+                if entry.get("fingerprint") != fingerprint:
+                    return "conflict", stored_receipt
+                return "duplicate", stored_receipt
+
+            entries.append(
+                {
+                    "scope": scope,
+                    "key": request_key,
+                    "fingerprint": fingerprint,
+                    "receipt": dict(receipt),
+                    "claimed_at": _time.time(),
+                }
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write(
+                path,
+                json.dumps(entries[-max(1, int(max_entries)) :], separators=(",", ":")),
+            )
+            return "claimed", None
+
+    def complete_chat_idempotency(
+        self,
+        key: str,
+        scope: str,
+        request_key: str,
+        receipt: dict[str, Any],
+    ) -> bool:
+        """Replace a provisional keyed-chat receipt after dispatch settles."""
+        path = self._chat_idempotency_path(key)
+        with self._locked(key):
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return False
+            if not isinstance(loaded, list):
+                return False
+            for entry in reversed(loaded):
+                if entry.get("scope") == scope and entry.get("key") == request_key:
+                    entry["receipt"] = dict(receipt)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write(path, json.dumps(loaded, separators=(",", ":")))
+                    return True
+            return False
+
+    def release_chat_idempotency(self, key: str, scope: str, request_key: str) -> bool:
+        """Remove a claim when admission failed before any work was accepted."""
+        path = self._chat_idempotency_path(key)
+        with self._locked(key):
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return False
+            if not isinstance(loaded, list):
+                return False
+            kept = [
+                entry
+                for entry in loaded
+                if not (entry.get("scope") == scope and entry.get("key") == request_key)
+            ]
+            if len(kept) == len(loaded):
+                return False
+            atomic_write(path, json.dumps(kept, separators=(",", ":")))
             return True
 
     def recent(

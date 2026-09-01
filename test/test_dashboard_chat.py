@@ -9353,6 +9353,127 @@ class TestApiChatSendReceiptMid:
         assert data["queued"] is True
         assert "mid" not in data
 
+    @pytest.mark.asyncio
+    async def test_keyed_ws_send_replay_returns_same_receipt_without_second_turn(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        calls = 0
+
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+            nonlocal calls
+            calls += 1
+            sl.append("chunk", "ack", "chunk")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            first_resp = await client.post(
+                "/api/chat?ws=1",
+                json={"message": "hello", "slot": "replay-slot", "meta": {"sendId": "s-1"}},
+            )
+            first = await first_resp.json()
+            duplicate_resp = await client.post(
+                "/api/chat?ws=1",
+                json={"message": "hello", "slot": "replay-slot", "meta": {"sendId": "s-1"}},
+            )
+            duplicate = await duplicate_resp.json()
+            await asyncio.sleep(0)
+
+        assert first_resp.status == 200
+        assert duplicate_resp.status == 200
+        assert duplicate == first
+        assert calls == 1
+        assert [m for m in state._slots["replay-slot"].messages if m["role"] == "user"]
+
+    @pytest.mark.asyncio
+    async def test_keyed_ws_replay_survives_state_recreation(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        first_state = _make_state(tmp_path)
+
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+            sl.append("chunk", "ack", "chunk")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
+
+        async with TestClient(TestServer(_make_app(first_state))) as client:
+            first_resp = await client.post(
+                "/api/chat?ws=1",
+                json={"message": "restart-safe", "slot": "restart-slot", "meta": {"sendId": "s-r"}},
+            )
+            first = await first_resp.json()
+
+        second_state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_app(second_state))) as client:
+            duplicate_resp = await client.post(
+                "/api/chat?ws=1",
+                json={"message": "restart-safe", "slot": "restart-slot", "meta": {"sendId": "s-r"}},
+            )
+            duplicate = await duplicate_resp.json()
+
+        assert duplicate_resp.status == 200
+        assert duplicate == first
+        assert not [m for m in second_state._slots["restart-slot"].messages if m["role"] == "user"]
+
+    @pytest.mark.asyncio
+    async def test_keyed_ws_distinct_send_ids_admit_distinct_turns(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+            sl.append("chunk", "ack", "chunk")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            first = await client.post(
+                "/api/chat?ws=1",
+                json={"message": "one", "slot": "distinct-slot", "meta": {"sendId": "s-1"}},
+            )
+            await asyncio.sleep(0.02)
+            second = await client.post(
+                "/api/chat?ws=1",
+                json={"message": "two", "slot": "distinct-slot", "meta": {"sendId": "s-2"}},
+            )
+            await asyncio.sleep(0)
+
+        assert first.status == 200
+        assert second.status == 200
+        user_messages = [
+            m["content"] for m in state._slots["distinct-slot"].messages if m["role"] == "user"
+        ]
+        assert user_messages == ["one", "two"]
+
+    @pytest.mark.asyncio
+    async def test_idempotency_header_replays_ws_receipt(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+            sl.append("chunk", "ack", "chunk")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            first_resp = await client.post(
+                "/api/chat?ws=1",
+                headers={"X-Idempotency-Key": "header-1"},
+                json={"message": "header replay", "slot": "header-slot"},
+            )
+            first = await first_resp.json()
+            duplicate_resp = await client.post(
+                "/api/chat?ws=1",
+                headers={"X-Idempotency-Key": "header-1"},
+                json={"message": "header replay", "slot": "header-slot"},
+            )
+            duplicate = await duplicate_resp.json()
+
+        assert first_resp.status == 200
+        assert duplicate_resp.status == 200
+        assert duplicate == first
+        assert len([m for m in state._slots["header-slot"].messages if m["role"] == "user"]) == 1
+
 
 # ── Plan action & auto-run tests ──
 
