@@ -8,6 +8,10 @@ docs live in [`../website/docs/`](../website/docs/README.md).
 New here? Start with [guides/install.md](guides/install.md), then
 [architecture/overview.md](architecture/overview.md).
 
+## Focused guides
+
+- [offline-mobile-migration.md](offline-mobile-migration.md) — responsive dashboard, durable offline chat syncing, and Android APK packaging.
+
 ## Where things live
 
 | Directory | What it is for |

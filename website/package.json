@@ -14,6 +14,9 @@
     "clean": "rm -rf dist && rm -rf node_modules",
     "dev": "vite",
     "build": "tsc -b && node --max-old-space-size=6144 ./node_modules/vite/bin/vite.js build",
+    "android:sync": "node scripts/build-android.mjs",
+    "android:debug": "node scripts/build-android.mjs && npx cap build android --androidreleasetype APK",
+    "android:open": "npx cap open android",
     "preview": "vite preview",
     "analyze": "vite build --mode analyze && node scripts/bundle-report.mjs",
     "test": "npm run test:website && npm run test:electron",
@@ -56,6 +59,8 @@
     "dist/"
   ],
   "dependencies": {
+    "@capacitor/android": "^8.5.1",
+    "@capacitor/core": "^8.5.1",
     "@dicebear/core": "9.4.3",
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
@@ -119,6 +124,7 @@
   },
   "devDependencies": {
     "@axe-core/react": "^4.10.1",
+    "@capacitor/cli": "^8.5.1",
     "@playwright/test": "1.58.2",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",

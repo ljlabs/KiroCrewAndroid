@@ -1,6 +1,6 @@
-# Offline-first mobile/PWA dashboard testing
+# Offline-first mobile dashboard and Android APK testing
 
-This guide covers the responsive dashboard migration in `website/`. The repository currently has **no native Android Gradle/Kotlin project**; the mobile target is the browser/PWA dashboard, which can be installed to an Android home screen after it is served over HTTPS (or tested in Chrome device emulation).
+This guide covers the responsive dashboard migration in `website/` and its thin Capacitor Android wrapper. The Android target reuses the browser/PWA dashboard and is packaged as one installable APK; it does not introduce a second native UI or local agent runtime.
 
 ## Prerequisites
 
@@ -38,7 +38,7 @@ npm run dev
 
 Open the Vite URL printed by the dev server, normally `http://localhost:5173`. The Vite configuration proxies `/api/*` and `/api/ws` to the gateway. For a production-like check, run `npm run build`, then use the gateway's bundled dashboard at `http://localhost:5476`.
 
-To test the mobile layout, open Chrome DevTools, enable the device toolbar, choose a phone-sized viewport, and navigate to `/chat`. The responsive dashboard shell and chat composer are the migration target. No Android Studio, Gradle wrapper, or APK build is expected from this repository.
+To test the mobile layout before packaging, open Chrome DevTools, enable the device toolbar, choose a phone-sized viewport, and navigate to `/chat`. The same responsive dashboard shell and chat composer are used in the APK.
 
 ## Manual offline test
 
@@ -87,9 +87,56 @@ The full frontend suite is available with `npm run test:website`; the full backe
 
 ## Important scope and limitations
 
-- This is a responsive web/PWA migration, not a native Android app. A native APK requires a separate Android project and platform integration.
+- This is a responsive web/PWA dashboard packaged in a thin Capacitor Android wrapper, not a native Android UI or standalone agent runtime.
 - The service worker caches the application shell only; IndexedDB owns API cache and durable outbox state. WebSocket traffic is not cached.
 - Offline sends require an existing slot. Creating a brand-new slot while completely offline is not silently attached to a different session.
 - The backend idempotency ledger is bounded and scoped to authenticated user/app/session/slot. It prevents duplicate keyed turns during normal replay and returns the original receipt for a duplicate key. A crash between recording a claim and starting the agent task is a narrow server-side recovery limitation.
 - Cached data is last-known data, not authoritative server state. Reconnect reconciliation always prefers the server transcript and server queue.
 - Attachments and complex side effects need their own durable contracts; they are not treated as generic offline JSON mutations.
+
+
+## Build and install the Android APK
+
+The Android app is a thin Capacitor wrapper around the existing `website/` build. It does not duplicate the React UI or offline outbox. The APK must be built with the HTTPS origin of a reachable Kiro Crew gateway because the agent backend cannot be bundled into an Android WebView.
+
+### Prerequisites
+
+- Android Studio or the Android command-line SDK
+- Android SDK Platform 36 and Build Tools 36
+- JDK 17 (the checked-in Gradle wrapper is validated with Java 17; newer JDKs must be compatible with Gradle 8.14.3)
+- A reachable Kiro Crew gateway with HTTPS and a valid dashboard token flow
+- Node.js 22 or newer
+
+Configure the gateway for phone access. A loopback-only gateway such as `127.0.0.1` is not reachable from a physical phone. Use a LAN/Tailscale/reverse-proxy HTTPS hostname and set that origin as `dashboard.url`; the gateway must also accept the phone's requests and WebSocket origin.
+
+From `website/`:
+
+```bash
+npm ci
+export KIROCREW_ANDROID_GATEWAY_URL="https://crew.example.com"
+npm run android:debug
+```
+
+The build script refuses to create a phone APK without `KIROCREW_ANDROID_GATEWAY_URL` and refuses plain HTTP unless explicitly overridden for local development. The resulting debug APK is under:
+
+```text
+website/android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+Install it with Android Debug Bridge:
+
+```bash
+adb install -r website/android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+Or open the `website/android/` project in Android Studio and run the `app` configuration on a connected phone. For an emulator-only HTTP gateway, use the emulator host alias and explicitly opt in:
+
+```bash
+KIROCREW_ANDROID_GATEWAY_URL="http://10.0.2.2:5476" \
+KIROCREW_ANDROID_ALLOW_CLEARTEXT=1 \
+npm run android:debug
+```
+
+The APK loads the same dashboard origin that the browser uses, so authentication, relative `/api` requests, `/api/ws`, service-worker caching, IndexedDB, and the durable offline chat outbox remain owned by the existing website code. When the phone loses connectivity, normal existing-slot messages remain in the local outbox; after reconnect the original `sendId` is replayed and the backend idempotency ledger prevents duplicate turns.
+
+This is one installable APK, but it is a gateway client rather than an offline standalone agent runtime: the APK cannot execute `kiro-cli` or the Python gateway locally. The gateway must be reachable for live agent work and the first app load; cached shell/outbox data can be viewed and synchronized later when connectivity returns.
