@@ -33,6 +33,14 @@ import './index.css'
 import './styles/cli-mode.css'
 // Register shared modules for federated app bundles (must be before any app loads)
 import './app-sdk/shared-modules'
+import { installFetchInterceptor } from './offline/interceptor'
+import { startSyncEngine } from './offline/syncEngine'
+
+// Register the REST proxy before any React component can issue an API request.
+// The sync engine is frontend-only; WebSocket and EventSource transports remain
+// untouched and continue to connect directly to the gateway.
+installFetchInterceptor()
+startSyncEngine()
 
 // Initialize RUM as early as possible
 initRum(__APP_VERSION__)
